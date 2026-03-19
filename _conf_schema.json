@@ -1,0 +1,27 @@
+{
+  "schedule_send_time": {
+    "description": "每日自动推送时间（HH:MM 格式）",
+    "type": "string",
+    "default": "09:00"
+  },
+  "whitelist_groups": {
+    "description": "白名单群组 ID 列表",
+    "type": "list",
+    "default": []
+  },
+  "blacklist_groups": {
+    "description": "黑名单群组 ID 列表",
+    "type": "list",
+    "default": []
+  },
+  "admin_user_ids": {
+    "description": "管理员用户 ID 列表（可触发登录指令）",
+    "type": "list",
+    "default": []
+  },
+  "enable_debug_log": {
+    "description": "是否启用调试日志",
+    "type": "bool",
+    "default": false
+  }
+}
