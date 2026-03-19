@@ -3,12 +3,14 @@ import json
 import re
 import shutil
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api import AstrBotConfig, logger
 
@@ -18,7 +20,6 @@ _PLUGIN_NAME = "astrbot_plugin_bili_daily_report"
 TRIGGER_KEYWORD = "今日快报"
 RELOGIN_KEYWORD = "bili_qrcode"
 RELOGIN_RESET_KEYWORD = "bili_qrcode_reset"
-SCHEDULE_FETCH_TIME = "03:00"
 SCHEDULE_SEND_TIME = "09:00"
 BROWSER_HEADLESS = True
 REQUEST_TIMEOUT_SECONDS = 30
@@ -29,8 +30,7 @@ PROFILE_CLEANUP_INTERVAL_DAYS = 7
 # 配置项默认值
 DEFAULTS = {
     "schedule_send_time": SCHEDULE_SEND_TIME,
-    "whitelist_groups": [],
-    "blacklist_groups": [],
+    "target_groups": [],  # 定时推送目标群组列表
     "admin_user_ids": [],
     "enable_debug_log": False,
 }
@@ -64,14 +64,38 @@ class BiliDailyReportPlugin(Star):
 
         # 读取配置
         self.schedule_send_time: str = _get(config, "schedule_send_time")
-        self.whitelist_groups: list = _get(config, "whitelist_groups")
-        self.blacklist_groups: list = _get(config, "blacklist_groups")
+        self.target_groups: list = _get(config, "target_groups")
         self.admin_user_ids: list = _get(config, "admin_user_ids")
         self.debug: bool = bool(_get(config, "enable_debug_log"))
+
+        # 群组 UMO 映射（群号 -> unified_msg_origin）
+        self.group_umo_mapping: dict = self._load_group_mapping()
 
         # 浏览器实例跟踪（用于安全关闭）
         self._pw = None
         self._ctx = None
+        self._bot = None  # 保存 bot 引用，供定时任务使用
+
+        # --- APScheduler 定时任务 ---
+        self.scheduler = AsyncIOScheduler()
+
+        try:
+            # 解析发送时间
+            hour, minute = self.schedule_send_time.split(":")
+            # 添加定时发送任务
+            self.scheduler.add_job(
+                self.scheduled_send,
+                'cron',
+                hour=int(hour),
+                minute=int(minute),
+                id="daily_report_send_job"
+            )
+            # 启动调度器
+            self.scheduler.start()
+            logger.info(f"定时发送任务已创建: {self.schedule_send_time}")
+        except Exception as e:
+            logger.error(f"定时发送任务创建失败: {traceback.format_exc()}")
+            logger.error(f"定时发送任务创建失败: {e}")
 
     def ensure_profile_dir(self) -> Path:
         """确保 profile 目录存在并返回其路径。"""
@@ -93,34 +117,54 @@ class BiliDailyReportPlugin(Star):
     def get_admin_user_ids(self) -> list:
         return self._safe_list(self.admin_user_ids)
 
-    def is_allowed_group(self, group_id: str) -> bool:
-        """判断群组是否允许发送。
-        - 黑名单优先：若在黑名单中则禁止
-        - 白名单次之：若白名单非空且群组不在白名单中则禁止
-        - 两者都为空：默认允许所有群组
+    def get_target_groups(self) -> list:
+        """获取配置的定时推送目标群组列表。"""
+        return self._safe_list(self.target_groups)
+
+    # ── 群组 UMO 映射 ──
+
+    def _group_mapping_path(self) -> Path:
+        return self._data_dir / "group_mapping.json"
+
+    def _load_group_mapping(self) -> dict:
+        """加载群号 -> unified_msg_origin 的映射。"""
+        p = self._group_mapping_path()
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save_group_mapping(self) -> None:
+        p = self._group_mapping_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.group_umo_mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _learn_group_umo(self, event: AstrMessageEvent) -> None:
+        """从消息事件中自动学习群号与 unified_msg_origin 的映射。"""
+        umo = getattr(event, 'unified_msg_origin', None) or str(getattr(event, 'unified_msg_origin', ''))
+        group_id = event.get_group_id()
+        if not umo or not group_id:
+            return
+        clean_gid = str(group_id)
+        if self.group_umo_mapping.get(clean_gid) != umo:
+            self.group_umo_mapping[clean_gid] = umo
+            self._save_group_mapping()
+            if self.debug:
+                logger.debug(f"[UMO学习] 群 {clean_gid} -> {umo}")
+
+    @staticmethod
+    def _extract_group_id(value: str) -> str:
+        """从纯群号或 unified_msg_origin 格式中提取群号。
+        例如 "957880653" -> "957880653"
+             "aiocqhttp:GroupMessage:957880653" -> "957880653"
         """
-        gid_str = str(group_id)
-        whitelist = set(self._safe_list(self.whitelist_groups))
-        blacklist = set(self._safe_list(self.blacklist_groups))
-
-        # 黑名单检查
-        if gid_str in blacklist:
-            return False
-
-        # 白名单检查（只有白名单非空时才生效）
-        if whitelist and gid_str not in whitelist:
-            return False
-
-        return True
-
-    def get_all_group_ids(self) -> list:
-        """获取所有已加入的群聊 ID 列表。"""
-        try:
-            group_list = self.context.get_group_list()
-            return [str(g.get("group_id", g.get("id", ""))) for g in group_list if g]
-        except Exception as e:
-            logger.warning(f"[群聊列表] 获取全部群聊失败: {e}")
-            return []
+        value = value.strip()
+        if ":" in value:
+            parts = value.split(":")
+            return parts[-1]
+        return value
 
     def is_admin_user(self, user_id) -> bool:
         admins = self.get_admin_user_ids()
@@ -584,172 +628,7 @@ class BiliDailyReportPlugin(Star):
         elapsed_days = (time.time() - last_ts) / 86400
         return elapsed_days < self._LOGIN_COOLDOWN_DAYS
 
-    # ── 定时抓取 ──
-
-    def _is_fetch_time_reached(self) -> bool:
-        """判断当前是否已过今天的 schedule_fetch_time 且今天尚未执行过抓取。"""
-        now = datetime.now()
-        try:
-            h, m = SCHEDULE_FETCH_TIME.split(":")
-            fetch_hour, fetch_min = int(h), int(m)
-        except (ValueError, AttributeError):
-            fetch_hour, fetch_min = 3, 0
-
-        if now.hour < fetch_hour or (now.hour == fetch_hour and now.minute < fetch_min):
-            return False
-
-        # 检查今天是否已经执行过
-        sched = self.load_schedule_meta()
-        last_ts = sched.get("last_fetch_check_ts", 0)
-        if last_ts > 0:
-            last_dt = datetime.fromtimestamp(last_ts)
-            if last_dt.date() == now.date():
-                return False
-        return True
-
-    async def scheduled_fetch(self):
-        """定时抓取：检查页面是否有今天对应期号，有则下载并缓存。"""
-        today = self.get_today_issue_code()
-        logger.info(f"[定时抓取] 开始执行, today_issue={today}")
-        sched = self.load_schedule_meta()
-        sched["last_fetch_check_ts"] = time.time()
-
-        pw = None
-        try:
-            await self.maybe_cleanup_profile_cache()
-            pw, ctx = await self.launch_persistent_browser()
-            page = await ctx.new_page()
-            await page.goto(TARGET_URL, wait_until="domcontentloaded",
-                            timeout=REQUEST_TIMEOUT_SECONDS * 1000)
-            logger.info(f"[定时抓取] 页面已打开: {TARGET_URL}")
-
-            try:
-                await self.wait_for_report_cards(page)
-            except TimeoutError:
-                # 页面渲染超时 → 可能是页面异常或登录失效，属于异常类，需通知
-                invalid, reason = await self.is_login_invalid(page, None)
-                if invalid:
-                    logger.error(f"[定时抓取] 页面渲染超时且登录失效: {reason}")
-                    sched["last_fetch_result"] = f"timeout_login_invalid: {reason}"
-                    self.save_schedule_meta(sched)
-                    await self._notify_admins(
-                        f"[定时抓取] 页面渲染超时且登录失效: {reason}\n"
-                        f"请发送 {RELOGIN_KEYWORD} 重新扫码登录"
-                    )
-                else:
-                    logger.warning("[定时抓取] 页面渲染超时")
-                    sched["last_fetch_result"] = "timeout"
-                    self.save_schedule_meta(sched)
-                    await self._notify_admins("[定时抓取] 页面渲染超时，请检查网络或页面状态")
-                return
-
-            report = await self.parse_latest_report_from_page(page)
-
-            # 登录失效检测
-            invalid, reason = await self.is_login_invalid(page, report)
-            if invalid:
-                logger.error(f"[定时抓取] 登录失效: {reason}")
-                sched["last_fetch_result"] = f"login_invalid: {reason}"
-                self.save_schedule_meta(sched)
-                await self._notify_admins(
-                    f"[定时抓取] B站登录态失效: {reason}\n"
-                    f"请发送 {RELOGIN_KEYWORD} 重新扫码登录"
-                )
-                return
-
-            if not report:
-                # 页面正常渲染但没有匹配的快报 → 未更新，不通知
-                logger.info(f"[定时抓取] 未找到银河快报内容, today_issue={today}")
-                sched["last_fetch_result"] = "no_report"
-                self.save_schedule_meta(sched)
-                return
-
-            if not self.is_today_issue(report["issue_code"]):
-                # 页面最新期号非今天 → 未更新，不通知
-                logger.info(f"[定时抓取] 页面最新期号 {report['issue_code']} 非今天 {today}，跳过")
-                sched["last_fetch_result"] = "not_today"
-                self.save_schedule_meta(sched)
-                return
-
-            # 检查本地缓存是否已经是今天的
-            meta = self.load_meta()
-            if meta and self.is_cache_valid_for_today(meta):
-                logger.info(f"[定时抓取] 今天的缓存已存在: {report['matched_title']}, sent={meta.get('sent')}")
-                sched["last_fetch_result"] = "cache_hit"
-                self.save_schedule_meta(sched)
-                return
-
-            # 下载新图片
-            self.clear_current_cache()
-            saved = await self.download_report_images(page, report["image_urls"])
-            if not saved:
-                logger.warning(f"[定时抓取] 图片下载失败, issue={report['issue_code']}")
-                sched["last_fetch_result"] = "download_failed"
-                self.save_schedule_meta(sched)
-                await self._notify_admins(f"[定时抓取] 图片下载失败 (issue={report['issue_code']})")
-                return
-
-            new_meta = {
-                "keyword": TRIGGER_KEYWORD,
-                "issue_code": report["issue_code"],
-                "matched_title": report["matched_title"],
-                "source_url": report["source_url"],
-                "fetched_at": datetime.now().isoformat(),
-                "files": [p.name for p in saved],
-                "sent": False,
-                "sent_at": None,
-            }
-            self.save_meta(new_meta)
-            logger.info(f"[定时抓取] 成功: {report['matched_title']}，{len(saved)} 张图片, sent=False")
-            sched["last_fetch_result"] = "ok"
-            self.save_schedule_meta(sched)
-
-        except Exception as e:
-            logger.error(f"[定时抓取] 异常: {e}")
-            sched["last_fetch_result"] = f"error: {e}"
-            self.save_schedule_meta(sched)
-            await self._notify_admins(f"[定时抓取] 异常: {e}")
-        finally:
-            if pw:
-                try:
-                    await ctx.close()
-                    await pw.stop()
-                except Exception:
-                    pass
-                self._pw = None
-                self._ctx = None
-
-    async def _fetch_loop(self):
-        """后台循环，每 60 秒检查一次是否到达抓取时间。"""
-        while True:
-            try:
-                if self._is_fetch_time_reached():
-                    await self.scheduled_fetch()
-            except Exception as e:
-                logger.error(f"[定时抓取循环] 异常: {e}")
-            await asyncio.sleep(60)
-
     # ── 定时发送 ──
-
-    def _is_send_time_reached(self) -> bool:
-        """判断当前是否已过今天的 schedule_send_time 且今天尚未执行过发送。"""
-        now = datetime.now()
-        try:
-            h, m = self.schedule_send_time.split(":")
-            send_hour, send_min = int(h), int(m)
-        except (ValueError, AttributeError):
-            send_hour, send_min = 9, 0
-
-        if now.hour < send_hour or (now.hour == send_hour and now.minute < send_min):
-            return False
-
-        sched = self.load_schedule_meta()
-        last_ts = sched.get("last_send_attempt_ts", 0)
-        if last_ts > 0:
-            last_dt = datetime.fromtimestamp(last_ts)
-            if last_dt.date() == now.date():
-                return False
-        return True
 
     async def _notify_admins(self, text: str):
         """私聊通知所有管理员。"""
@@ -762,34 +641,78 @@ class BiliDailyReportPlugin(Star):
 
     async def _send_images_to_groups(self, files: list[Path]) -> tuple[list[str], list[str]]:
         """向所有目标群发送图片，返回 (成功群列表, 失败群列表)。
-        根据白名单/黑名单过滤目标群组。
+        发送策略：
+        1. 先尝试 OneBot call_action 直接发送
+        2. 失败则用 context.send_message + 学习到的 UMO 兜底
+        支持 target_groups 中填写纯群号或 unified_msg_origin 格式。
         """
-        # 获取所有群聊并根据白名单/黑名单过滤
-        all_groups = self.get_all_group_ids()
-        if not all_groups:
-            logger.warning("[定时发送] 无法获取群聊列表，跳过发送")
-            return [], []
-
-        target_groups = [gid for gid in all_groups if self.is_allowed_group(gid)]
-        whitelist = self._safe_list(self.whitelist_groups)
-        blacklist = self._safe_list(self.blacklist_groups)
-        logger.info(f"[定时发送] 白名单={whitelist}, 黑名单={blacklist}, 目标群组={target_groups}")
+        target_groups = self.get_target_groups()
+        logger.info(f"[定时发送] 目标群组={target_groups}")
 
         if not target_groups:
-            logger.warning("[定时发送] 无目标群组（黑白名单过滤后），跳过发送")
+            logger.warning("[定时发送] 未配置目标群组，跳过发送")
             return [], []
+
+        # 通过 platform_manager 获取平台实例
+        platform_manager = getattr(self.context, 'platform_manager', None)
+        platforms = platform_manager.get_insts() if platform_manager else []
 
         ok_groups = []
         fail_groups = []
-        for gid in target_groups:
-            try:
+        for raw_gid in target_groups:
+            clean_gid = self._extract_group_id(raw_gid)
+            sent = False
+
+            # 策略1: OneBot call_action 直接发送
+            if platforms:
                 for img_path in files:
-                    await self.context.send_message(gid, img_path=str(img_path))
-                ok_groups.append(gid)
-                logger.info(f"[定时发送] 群 {gid} 发送成功，{len(files)} 张图")
-            except Exception as e:
-                fail_groups.append(gid)
-                logger.error(f"[定时发送] 群 {gid} 发送失败: {e}")
+                    img_sent = False
+                    for platform in platforms:
+                        try:
+                            bot_client = getattr(platform, 'get_client', lambda: None)() or \
+                                         getattr(platform, 'client', None) or \
+                                         getattr(platform, 'bot', None)
+                            if not bot_client:
+                                continue
+                            call_action = getattr(bot_client, 'call_action', None) or \
+                                         getattr(getattr(bot_client, 'api', None), 'call_action', None)
+                            if call_action:
+                                await call_action("send_group_msg", group_id=int(clean_gid), message=[
+                                    {"type": "image", "data": {"file": f"file:///{img_path}"}}
+                                ])
+                                img_sent = True
+                                break
+                        except Exception as e:
+                            logger.debug(f"[定时发送] OneBot发送失败 群{clean_gid}: {e}")
+                    if not img_sent:
+                        break
+                else:
+                    # 所有图片都发送成功
+                    sent = True
+
+            # 策略2: context.send_message + UMO 兜底
+            if not sent:
+                # 确定 UMO：如果配置中直接填了 UMO 格式则直接用，否则从映射中查找
+                umo = raw_gid if ":" in raw_gid else self.group_umo_mapping.get(clean_gid)
+                if umo:
+                    try:
+                        for img_path in files:
+                            chain = MessageChain().file_image(str(img_path))
+                            await self.context.send_message(umo, chain)
+                        sent = True
+                        logger.info(f"[定时发送] 群 {clean_gid} 通过 UMO 兜底发送成功")
+                    except Exception as e:
+                        logger.warning(f"[定时发送] 群 {clean_gid} UMO兜底发送失败: {e}")
+                else:
+                    logger.warning(f"[定时发送] 群 {clean_gid} 无可用 UMO 映射，跳过兜底")
+
+            if sent:
+                ok_groups.append(clean_gid)
+                logger.info(f"[定时发送] 群 {clean_gid} 发送成功，{len(files)} 张图")
+            else:
+                fail_groups.append(clean_gid)
+                logger.error(f"[定时发送] 群 {clean_gid} 发送失败")
+
         return ok_groups, fail_groups
 
     async def scheduled_send(self):
@@ -928,16 +851,6 @@ class BiliDailyReportPlugin(Star):
                     pass
                 self._pw = None
                 self._ctx = None
-
-    async def _send_loop(self):
-        """后台循环，每 60 秒检查一次是否到达发送时间。"""
-        while True:
-            try:
-                if self._is_send_time_reached():
-                    await self.scheduled_send()
-            except Exception as e:
-                logger.error(f"[定时发送循环] 异常: {e}")
-            await asyncio.sleep(60)
 
     # ── 二维码登录 ──
 
@@ -1097,17 +1010,55 @@ class BiliDailyReportPlugin(Star):
 
     async def initialize(self):
         logger.info("BiliDailyReport 插件已加载")
+
+        # 尝试获取 bot 引用供定时任务使用
+        # 尝试多种方式获取
+        self._bot = getattr(self.context, 'bot', None) or \
+                    getattr(self.context, '_bot', None) or \
+                    getattr(self.context, 'client', None) or \
+                    getattr(self.context, 'platform', None)
+
+        # 如果 context 没有 bot，尝试从 platform 获取
+        if self._bot is None:
+            platform = getattr(self.context, 'platform', None)
+            if platform is not None:
+                self._bot = getattr(platform, 'bot', None) or \
+                            getattr(platform, '_bot', None) or \
+                            getattr(platform, 'client', None) or \
+                            platform
+
         if self.debug:
             logger.debug(f"配置: trigger={TRIGGER_KEYWORD}, "
                          f"headless={BROWSER_HEADLESS}, timeout={REQUEST_TIMEOUT_SECONDS}s, "
-                         f"fetch={SCHEDULE_FETCH_TIME}, send={self.schedule_send_time}, "
+                         f"send={self.schedule_send_time}, target_groups={self.get_target_groups()}, "
                          f"cleanup_interval={PROFILE_CLEANUP_INTERVAL_DAYS}d")
-        self._fetch_task = asyncio.create_task(self._fetch_loop())
-        self._send_task = asyncio.create_task(self._send_loop())
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         text = event.message_str.strip()
+
+        # 自动保存 bot 引用（如果尚未保存）
+        if self._bot is None:
+            bot = getattr(event, 'bot', None)
+            if bot is not None:
+                self._bot = bot
+                logger.info(f"[消息事件] 已保存 bot 引用，类型: {type(bot).__name__}")
+
+        # 自动学习群组 UMO 映射
+        self._learn_group_umo(event)
+
+        # 查询当前群的 unified_msg_origin（方便用户配置 target_groups）
+        if text == "快报群组ID":
+            umo = getattr(event, 'unified_msg_origin', None)
+            group_id = event.get_group_id()
+            if umo:
+                msg = (f"当前会话的 unified_msg_origin:\n{umo}\n"
+                       f"群号: {group_id or '未知'}\n"
+                       f"可将群号或上方完整字符串添加到配置的 target_groups 中")
+            else:
+                msg = "无法获取当前会话的 unified_msg_origin"
+            yield event.plain_result(msg)
+            return
 
         if text == TRIGGER_KEYWORD:
             user_id = event.get_sender_id()
@@ -1238,8 +1189,6 @@ class BiliDailyReportPlugin(Star):
 
     async def terminate(self):
         await self._close_browser()
-        for task in ("_fetch_task", "_send_task"):
-            t = getattr(self, task, None)
-            if t:
-                t.cancel()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         logger.info("BiliDailyReport 插件已卸载")

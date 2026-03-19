@@ -4,14 +4,10 @@
     "type": "string",
     "default": "09:00"
   },
-  "whitelist_groups": {
-    "description": "白名单群组 ID 列表",
+  "target_groups": {
+    "description": "定时推送目标群组列表",
     "type": "list",
-    "default": []
-  },
-  "blacklist_groups": {
-    "description": "黑名单群组 ID 列表",
-    "type": "list",
+    "hint": "填写群号即可，如：[\"957880653\", \"123456789\"]。也支持 unified_msg_origin 格式，如：[\"aiocqhttp:GroupMessage:957880653\"]。在群内发送「快报群组ID」可获取当前群的标识",
     "default": []
   },
   "admin_user_ids": {
