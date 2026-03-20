@@ -25,8 +25,7 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `schedule_send_time` | string | `09:00` | 每日自动推送时间（HH:MM格式） |
-| `whitelist_groups` | list | `[]` | 白名单群组（仅在这些群发送，为空则不限制） |
-| `blacklist_groups` | list | `[]` | 黑名单群组（在这些群不发送，为空则不限制） |
+| `target_groups` | list | `[]` | 推送群组（仅在这些群发送） |
 | `admin_user_ids` | list | `[]` | 管理员用户ID（可触发登录指令） |
 | `enable_debug_log` | bool | `false` | 是否启用调试日志 |
 
