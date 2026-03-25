@@ -1,6 +1,6 @@
 name: astrbot_plugin_bili_daily_report
 display_name: 银河快报
-desc: 通过无头启动自动化浏览器，自动抓取B站up银河快报动态中的图片并发送给指定群组。
-version: v0.0.2
+desc: 通过无头启动自动化浏览器，自动抓取B站up银河快报动态中的图片并发送给指定群组。同时提供体验较为良好的正常随机战备和不考虑体验的完全随机战备两种模式。
+version: v0.0.3
 author: 椛椿
 repo: https://github.com/MomijiOXO/astrbot_plugin_HD2_daily_report

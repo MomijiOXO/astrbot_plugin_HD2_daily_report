@@ -13,6 +13,7 @@ from astrbot.api import AstrBotConfig, logger
 from .cache import CacheManager
 from .scraper import BiliScraper
 from .models import CacheMeta, TZ_SHANGHAI
+from .loadout import generate_random_loadout, generate_full_random_loadout, format_loadout
 
 _PLUGIN_NAME = "astrbot_plugin_bili_daily_report"
 
@@ -720,6 +721,18 @@ class BiliDailyReportPlugin(Star):
             return
         async for result in self.start_bili_qrcode_login(event):
             yield result
+
+    @filter.command("随机战备")
+    async def cmd_random_loadout(self, event: AstrMessageEvent):
+        """按规则随机生成绝地潜兵2战备配置。"""
+        loadout = generate_random_loadout()
+        yield event.plain_result(format_loadout(loadout))
+
+    @filter.command("全随机战备")
+    async def cmd_full_random_loadout(self, event: AstrMessageEvent):
+        """完全随机生成绝地潜兵2战备配置，不遵循任何规则。"""
+        loadout = generate_full_random_loadout()
+        yield event.plain_result(format_loadout(loadout, full_random=True))
 
     async def terminate(self):
         await self._scraper.close_browser()
