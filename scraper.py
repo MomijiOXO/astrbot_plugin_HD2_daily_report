@@ -1,12 +1,42 @@
 import asyncio
+import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
 from astrbot.api import logger
 
 from .models import ReportResult
+
+
+def build_playwright_proxy_from_env() -> dict | None:
+    """Build Playwright proxy config from environment variables."""
+    proxy_url = None
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]:
+        proxy_url = os.environ.get(key)
+        if proxy_url:
+            break
+
+    if not proxy_url:
+        return None
+
+    try:
+        parsed = urlparse(proxy_url)
+        if not parsed.scheme or not parsed.hostname:
+            return None
+
+        config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 80}"}
+
+        if parsed.username:
+            config["username"] = parsed.username
+        if parsed.password:
+            config["password"] = parsed.password
+
+        return config
+    except Exception:
+        return None
 
 
 class BiliScraper:
@@ -71,6 +101,7 @@ class BiliScraper:
         self._user_agent = user_agent
         self._request_timeout = request_timeout
         self._max_images = max_images
+        self.proxy = build_playwright_proxy_from_env()
 
         # 浏览器实例跟踪
         self._pw = None
@@ -100,11 +131,20 @@ class BiliScraper:
         await self.close_browser()
         self._profile_dir.mkdir(parents=True, exist_ok=True)
         pw = await async_playwright().start()
-        ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(self._profile_dir),
-            headless=self._headless,
-            user_agent=self._user_agent,
-        )
+
+        launch_kwargs = {
+            "user_data_dir": str(self._profile_dir),
+            "headless": self._headless,
+            "user_agent": self._user_agent,
+        }
+
+        if self.proxy:
+            launch_kwargs["proxy"] = self.proxy
+            logger.info(f"使用代理: {self.proxy['server']}")
+        else:
+            logger.info("直连模式 (无代理)")
+
+        ctx = await pw.chromium.launch_persistent_context(**launch_kwargs)
         self._pw = pw
         self._ctx = ctx
         return pw, ctx
