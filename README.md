@@ -34,10 +34,10 @@
 
 ## 报错
 
-如果遇到报错说playwright install这样的报错，是因为docker或是你本地没有安装对应的浏览器。
-如果是docker需要进入容器中输入python -m playwright install。
-linux可以直接输入python -m playwright install。
-windwos需要打开cmd，然后输入python -m playwright install。
+- 如果遇到报错说playwright install这样的报错，是因为docker或是你本地没有安装对应的浏览器。
+- 如果是docker需要进入容器中输入python -m playwright install。
+- linux可以直接输入python -m playwright install。
+- windwos需要打开cmd，然后输入python -m playwright install。
 
 ## 支持
 
