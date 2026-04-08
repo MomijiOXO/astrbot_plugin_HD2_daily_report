@@ -32,6 +32,13 @@
 | `admin_user_ids` | list | `[]` | 管理员用户ID（可触发登录指令） |
 | `enable_debug_log` | bool | `false` | 是否启用调试日志 |
 
+## 报错
+
+如果遇到报错说playwright install这样的报错，是因为docker或是你本地没有安装对应的浏览器。
+如果是docker需要进入容器中输入python -m playwright install。
+linux可以直接输入python -m playwright install。
+windwos需要打开cmd，然后输入python -m playwright install。
+
 ## 支持
 
 - [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
